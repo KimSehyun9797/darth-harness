@@ -1,0 +1,41 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ROOT=\"$(git rev-parse --show-toplevel)\"; test -x \"$ROOT/.harness/bin/decision-hook\" || { echo 'decision-hook missing' >&2; exit 2; }; exec \"$ROOT/.harness/bin/decision-hook\" codex",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || true)\"; test -x \"$ROOT/.harness/bin/live-status-hook\" && \"$ROOT/.harness/bin/live-status-hook\" codex || true",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || true)\"; LAUNCHER=\"$HOME/.local/bin/agent-harness-live-status\"; test -n \"$ROOT\" && test -x \"$LAUNCHER\" && \"$LAUNCHER\" start \"$ROOT\" codex >/dev/null 2>&1 || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ROOT=\"$(git rev-parse --show-toplevel)\"; test -x \"$ROOT/.harness/bin/decision-hook\" || { echo 'decision-hook missing' >&2; exit 2; }; exec \"$ROOT/.harness/bin/decision-hook\" codex",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || true)\"; test -x \"$ROOT/.harness/bin/live-status-hook\" && \"$ROOT/.harness/bin/live-status-hook\" codex || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

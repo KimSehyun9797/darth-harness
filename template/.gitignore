@@ -1,0 +1,7 @@
+.harness/live-status.env
+.harness/live-status.env.tmp.*
+.harness/live-workers/
+.harness/live-status-pane.env
+.harness/live-roadmap.yaml
+.harness/live-roadmap.yaml.tmp.*
+log/cold/

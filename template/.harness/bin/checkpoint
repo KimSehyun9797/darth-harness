@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=template/.harness/lib/state.sh
+. "$BIN_DIR/../lib/state.sh"
+
+validate_state
+if [ "${1:-}" = --check-only ]; then
+  echo "checkpoint: state valid"
+  exit 0
+fi
+reason="${1:?사용법: .harness/bin/checkpoint --check-only|<reason>}"
+printf '%s' "$reason" | grep -Eq '^[A-Za-z0-9._:-]+$' \
+  || state_fail "reason은 공백 없는 안전한 식별자여야 합니다"
+assert_index_clean
+assert_core_only
+checkpoint_paths=(STATUS.md tasks.yaml log/HANDOFF.md)
+for id in $(yq -r '.tasks[] | select(.status == "verified") | .id' "$PROJECT_ROOT/tasks.yaml"); do
+  for evidence in "log/$id.verify.log" "log/$id.verified.yaml"; do
+    [ -f "$PROJECT_ROOT/$evidence" ] && checkpoint_paths+=("$evidence")
+  done
+  receipt="$(yq -r '.verification_receipt // ""' "$PROJECT_ROOT/log/$id.verified.yaml")"
+  printf '%s' "$receipt" | grep -Eq '^log/receipts/[A-Za-z0-9._-]+\.yaml$' \
+    || state_fail "$id: 안전한 verification_receipt 경로 없음"
+  [ -f "$PROJECT_ROOT/$receipt" ] || state_fail "$id: verification_receipt 파일 없음"
+  checkpoint_paths+=("$receipt")
+  for attempt in "$PROJECT_ROOT/log/verification-attempts/$id"/*.intent.yaml \
+    "$PROJECT_ROOT/log/verification-attempts/$id"/*.result.yaml; do
+    [ -e "$attempt" ] || continue
+    attempt="${attempt#"$PROJECT_ROOT/"}"
+    printf '%s' "$attempt" | grep -Eq "^log/verification-attempts/$id/[0-9]{6}\\.(intent|result)\\.yaml$" \
+      || state_fail "$id: 안전하지 않은 verification attempt 경로"
+    checkpoint_paths+=("$attempt")
+  done
+done
+for id in $(yq -r '.tasks[].id' "$PROJECT_ROOT/tasks.yaml"); do
+  stop="log/$id.budget-stop.yaml"
+  if [ -f "$PROJECT_ROOT/$stop" ]; then
+    [ "$(TASK_ID="$id" yq -r '.tasks[] | select(.id == strenv(TASK_ID)) | .status' "$PROJECT_ROOT/tasks.yaml")" = blocked ] \
+      || state_fail "$id: budget stop checkpoint 전 task status를 blocked로 기록하세요"
+    for state_doc in STATUS.md log/HANDOFF.md; do
+      if ! grep -Fq BUDGET_STOP "$PROJECT_ROOT/$state_doc" || ! grep -Fq "$id" "$PROJECT_ROOT/$state_doc"; then
+        state_fail "$id: $state_doc에 BUDGET_STOP 이유와 task ID를 기록하세요"
+      fi
+    done
+  fi
+  if [ -f "$PROJECT_ROOT/$stop" ] || git -C "$PROJECT_ROOT" ls-files --error-unmatch "$stop" >/dev/null 2>&1; then
+    checkpoint_paths+=("$stop")
+  fi
+done
+[ -n "$(git -C "$PROJECT_ROOT" status --porcelain -- "${checkpoint_paths[@]}")" ] \
+  || state_fail "커밋할 상태 전이가 없습니다"
+commit_paths "chore(harness): checkpoint $reason" "${checkpoint_paths[@]}"
+roadmap="$BIN_DIR/live-roadmap"
+if [ -x "$roadmap" ]; then
+  HARNESS_PROJECT_ROOT="$PROJECT_ROOT" "$roadmap" publish --now "$(date +%s)" \
+    >/dev/null 2>&1 || true
+fi
+echo "checkpoint: $(git -C "$PROJECT_ROOT" rev-parse --short HEAD)"

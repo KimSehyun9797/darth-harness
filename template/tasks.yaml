@@ -1,0 +1,56 @@
+# tasks.yaml — 작업 의존성 DAG. 오케스트레이터만 수정한다 (결정 34).
+# status: pending|running|done|verified|failed|blocked|hold|skipped
+contract_version: 3
+context_contract_version: 1
+execution_policy:
+  default_workers: 1
+  max_concurrent_workers: 3
+  max_delegation_depth: 0
+tasks: []
+# 스키마 예시 (실제 태스크로 교체):
+# - id: T-001
+#   name: 예시 태스크
+#   lean_gate:
+#     decision: minimal
+#     evidence: "기존 기능으로 해결할 수 없어 명시 범위의 최소 변경을 사용"
+#   execution: worker            # deterministic | worker
+#   role: standard_worker        # none | economy_worker | standard_worker | frontier_worker
+#   grade: T1                    # T0~T3
+#   effort: medium               # none | low | medium | high
+#   ceremony:
+#     design_approved: false
+#     independent_review: false
+#     full_regression: false
+#     approval_gates: []         # T3만 [start, risk]
+#   budget:
+#     concurrent_workers: 1
+#     total_workers: 1
+#     model_turns_per_worker: 1
+#     model_runs: 1
+#     edit_iterations: 1
+#     related_test_runs: 2
+#     full_test_runs: 0
+#     max_input_tokens: 20000
+#     max_output_tokens: 5000
+#     # token 값은 source_sha256이 있는 normalized usage receipt에서만 읽는 사후 advisory.
+#     # receipt가 없는 첫 실행은 unknown이며 이 두 값을 사전 hard cap으로 쓰지 않는다.
+#     changed_files: 3
+#     changed_lines: 200
+#     dependencies_added: 0
+#   depends_on: []               # 이 ID들의 .done은 DONE이고 .verified.yaml과 tasks status=verified 계약을 모두 통과해야 기동
+#   worktree: "."                # 쓰기 워커는 격리 worktree 경로
+#   write_paths: ["source/"]     # 쓰기 소유 경로
+#   done_when: "log/T-001.done 생성 + 테스트 통과"
+#   on_fail: hold_downstream     # 실패 정책
+#   status: pending
+#   run_id: ""                   # 실행 시 새 안전한 ID를 발급하고 retry마다 교체
+#   brief: agents/worker-T-001.md
+#   skills: [superpowers:test-driven-development] # 필수 계약; 실제 활성 스킬은 워커가 별도 보고
+#   context:
+#     hot_paths: ["context/interfaces.md"]
+#     cold_paths: ["docs/architecture.md"]
+#     skills: ["superpowers:test-driven-development"]
+#   verify:                      # 승격(verified)에 필수인 기계 검증 명령 (B-001)
+#     command: bash              # eval 금지 — command/args 분리 (결정 12)
+#     args: ["tests/check-T-001.sh"]
+#     cacheable: true             # 시간·네트워크·외부 상태 비의존 검사만 영수증 재사용

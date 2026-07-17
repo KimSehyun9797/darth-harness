@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Provider hook 입력에서 모델명만 골라 live status에 best-effort로 전달한다.
+set -u
+
+provider="${1:-}"
+case "$provider" in claude|codex) :;; *) exit 2;; esac
+input="$(cat 2>/dev/null || true)"
+root="${HARNESS_PROJECT_ROOT:-$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null || true)}"
+[ -n "$root" ] || exit 0
+root="$(git -C "$root" rev-parse --show-toplevel 2>/dev/null || true)"
+[ -n "$root" ] || exit 0
+writer="$root/.harness/bin/live-status"
+[ -x "$writer" ] || exit 0
+model="$(printf '%s' "$input" | jq -r '
+  if (.model | type) == "string" then .model
+  elif (.model.display_name | type) == "string" then .model.display_name
+  else empty end
+' 2>/dev/null || true)"
+[ -n "$model" ] || exit 0
+now="$(date +%s)"
+if [ -n "${HARNESS_WORKER_RUN_ID:-}" ]; then
+  HARNESS_PROJECT_ROOT="$root" "$writer" worker-update \
+    --run-id "$HARNESS_WORKER_RUN_ID" --model-observed "$model" --updated-at "$now" \
+    >/dev/null 2>&1 || true
+else
+  HARNESS_PROJECT_ROOT="$root" "$writer" orchestrator-update \
+    --provider "$provider" --model-observed "$model" --captured-at "$now" \
+    >/dev/null 2>&1 || true
+fi
+exit 0

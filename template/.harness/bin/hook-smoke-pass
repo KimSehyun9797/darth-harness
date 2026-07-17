@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=template/.harness/lib/state.sh
+. "$BIN_DIR/../lib/state.sh"
+
+provider="${1:?사용법: .harness/bin/hook-smoke-pass <claude|codex> <decision-id>}"
+id="${2:?사용법: .harness/bin/hook-smoke-pass <claude|codex> <decision-id>}"
+case "$provider" in claude|codex) :;; *) state_fail "provider는 claude|codex";; esac
+pending="$PROJECT_ROOT/log/pending-decision.yaml"
+answer="log/decisions/$id.answer.md"
+[ -f "$pending" ] && [ "$(yq -r '.id' "$pending")" = "$id" ] \
+  && [ "$(yq -r '.status' "$pending")" = answer_captured ] \
+  || state_fail "캡처 완료된 smoke decision이 아님"
+[ -f "$PROJECT_ROOT/$answer" ] || state_fail "smoke answer 없음"
+[ "$(yq -r '.opened_by // ""' "$pending")" = "$provider" ] \
+  || state_fail "pending opened_by가 ${provider}가 아님"
+answer_provider="$(awk '/^---$/ {exit} /^provider: / {sub(/^provider: /, ""); print; exit}' "$PROJECT_ROOT/$answer")"
+[ "$answer_provider" = "$provider" ] || state_fail "answer provider metadata가 ${provider}가 아님"
+[ "$(yq -r '.smoke // false' "$pending")" = true ] || state_fail "smoke pending이 아님"
+nonce_sha="$(native_smoke_nonce_sha256)" || state_fail "smoke nonce가 없음"
+[ "$nonce_sha" = "$(yq -r '.nonce_sha256 // ""' "$pending")" ] || state_fail "smoke nonce가 pending과 다름"
+[ "$nonce_sha" = "$(awk '/^nonce_sha256: / {print $2; exit}' "$PROJECT_ROOT/$answer")" ] || state_fail "answer nonce 증거가 pending과 다름"
+validate_state
+assert_index_clean
+[ -z "$(git -C "$PROJECT_ROOT" status --porcelain)" ] || state_fail "smoke PASS 기록 전 worktree가 깨끗해야 함"
+config="$(provider_config_path "$provider")"
+version_text="$(provider_version "$provider")"
+version_safe="$(printf '%s' "$version_text" | tr '\n' ' ' | sed "s/'/''/g")"
+pass="log/hook-smoke-$provider.pass"
+answer_commit="$(git -C "$PROJECT_ROOT" log -1 --format=%H -- "$answer")"
+prompt_sha="$(awk '/^prompt_sha256: / {print $2; exit}' "$PROJECT_ROOT/$answer")"
+{
+  echo 'version: 1'
+  echo "provider: $provider"
+  echo "verified_at: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  echo "client_version: '$version_safe'"
+  echo "config_sha256: $(sha256_file "$PROJECT_ROOT/$config")"
+  echo "hook_sha256: $(sha256_file "$PROJECT_ROOT/.harness/bin/decision-hook")"
+  echo "decision_id: $id"
+  echo "answer_commit: $answer_commit"
+  echo "prompt_sha256: $prompt_sha"
+  echo "nonce_sha256: $nonce_sha"
+} > "$PROJECT_ROOT/$pass"
+commit_paths "chore(harness): record $provider hook smoke" "$pass"
+provider_ready "$provider" || state_fail "기록 직후 readiness 검증 실패"
+echo "$provider hook smoke PASS: $(git -C "$PROJECT_ROOT" rev-parse --short HEAD)"

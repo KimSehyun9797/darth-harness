@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=template/.harness/lib/state.sh
+. "$BIN_DIR/../lib/state.sh"
+
+provider="${1:-unknown}"
+input="$(mktemp "${TMPDIR:-/tmp}/harness-hook.XXXXXX")"
+raw="$(mktemp "${TMPDIR:-/tmp}/harness-raw.XXXXXX")"
+pending_backup="$(mktemp "${TMPDIR:-/tmp}/harness-pending.XXXXXX")"
+git_error="$(mktemp "${TMPDIR:-/tmp}/harness-git.XXXXXX")"
+lock="$PROJECT_ROOT/log/.decision-capture.lock"
+locked=0
+capture_inflight=0
+capture_id=""
+capture_base=""
+prepared_answer=""
+prepared_pending=""
+recovery_build=""
+rollback_proven=1
+rollback_capture() {
+  local answer recovery base_ok index_ok pending_ok recovery_ok recovery_tmp pending_tmp
+  [ "$capture_inflight" = 1 ] || return 0
+  rollback_proven=0
+  answer="$PROJECT_ROOT/log/decisions/$capture_id.answer.md"
+  recovery="$PROJECT_ROOT/log/decisions/$capture_id.answer.pending.md"
+  if [ -n "$capture_base" ] && [ "$(git -C "$PROJECT_ROOT" rev-parse HEAD)" != "$capture_base" ]; then
+    git -C "$PROJECT_ROOT" reset --soft "$capture_base" >/dev/null 2>&1 || true
+  fi
+  git -C "$PROJECT_ROOT" reset "$capture_base" -- log/pending-decision.yaml \
+    "log/decisions/$capture_id.answer.md" >/dev/null 2>&1 || true
+  rm -f "$answer"
+  if [ -s "$prepared_answer" ]; then
+    recovery_tmp="$recovery.rollback.$$"
+    if ! cp "$prepared_answer" "$recovery_tmp" 2>/dev/null || ! mv -f "$recovery_tmp" "$recovery"; then
+      rm -f "$recovery_tmp"
+      return 0
+    fi
+  fi
+  if [ -s "$pending_backup" ]; then
+    pending_tmp="$PROJECT_ROOT/log/.pending-decision.rollback.$$"
+    if ! cp "$pending_backup" "$pending_tmp" 2>/dev/null \
+        || ! mv -f "$pending_tmp" "$PROJECT_ROOT/log/pending-decision.yaml"; then
+      rm -f "$pending_tmp"
+      return 0
+    fi
+  fi
+  base_ok="$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null)"
+  [ "$base_ok" = "$capture_base" ] || return 0
+  index_ok="$(git -C "$PROJECT_ROOT" diff --cached --name-only -- log/pending-decision.yaml "log/decisions/$capture_id.answer.md")"
+  [ -z "$index_ok" ] || return 0
+  pending_ok=1; recovery_ok=1
+  cmp -s "$pending_backup" "$PROJECT_ROOT/log/pending-decision.yaml" || pending_ok=0
+  cmp -s "$prepared_answer" "$recovery" || recovery_ok=0
+  [ "$pending_ok" = 1 ] && [ "$recovery_ok" = 1 ] || return 0
+  rollback_proven=1
+  capture_inflight=0
+}
+cleanup() {
+  rollback_capture
+  if [ "$rollback_proven" = 1 ] || [ "$capture_inflight" = 0 ]; then
+    rm -f "$input" "$raw" "$pending_backup" "$git_error" "$prepared_answer" "$prepared_pending"
+  else
+    printf 'immutable recovery copy retained at %s\n' "$prepared_answer" >&2
+    rm -f "$input" "$raw" "$pending_backup" "$git_error"
+  fi
+  if [ "$locked" = 1 ]; then rm -f "$lock/pid"; rmdir "$lock" 2>/dev/null || true; fi
+}
+trap cleanup EXIT
+trap 'echo "decision capture interrupted; recovery file retained" >&2; exit 2' HUP INT TERM
+
+block() {
+  printf '%s\n' '{"decision":"block","reason":"Harness decision state was not safely persisted. Inspect log/pending-decision.yaml and log/decisions before retrying."}'
+  exit 0
+}
+block_close() {
+  printf '%s\n' '{"decision":"block","reason":"The captured decision answer is committed, but it has not been applied and closed. Read the answer, update STATUS/HANDOFF/tasks, and run decision-close before stopping."}'
+  exit 0
+}
+trap block ERR
+
+case "$provider" in claude|codex) :;; *) block;; esac
+cat > "$input"
+event="$(yq -r '.hook_event_name // ""' "$input")"
+
+acquire_lock() {
+  if mkdir "$lock" 2>/dev/null; then echo "$$" > "$lock/pid"; locked=1; return 0; fi
+  owner="$(cat "$lock/pid" 2>/dev/null || echo '')"
+  if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+    rm -f "$lock/pid"; rmdir "$lock" 2>/dev/null || true
+    mkdir "$lock"; echo "$$" > "$lock/pid"; locked=1; return 0
+  fi
+  return 1
+}
+
+emit_context() {
+  printf '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"Decision answer is committed at log/decisions/%s.answer.md in commit %s. Read that file before acting; the current prompt is only a recovery trigger when a pending recovery file existed."}}\n' "$1" "$2"
+}
+
+verify_prepared_capture() {
+  local path prepared working changed
+  while IFS= read -r changed; do
+    case "$changed" in
+      log/pending-decision.yaml|log/decisions/"$capture_id".answer.md) :;;
+      *) return 1;;
+    esac
+  done <<EOF
+$(git -C "$PROJECT_ROOT" diff-tree --no-commit-id --name-only -r HEAD)
+EOF
+  for path in log/pending-decision.yaml "log/decisions/$capture_id.answer.md"; do
+    case "$path" in
+      log/pending-decision.yaml) prepared="$prepared_pending";;
+      *) prepared="$prepared_answer";;
+    esac
+    git -C "$PROJECT_ROOT" show "HEAD:$path" > "$raw" || return 1
+    cmp -s "$prepared" "$raw" || return 1
+    git -C "$PROJECT_ROOT" show ":$path" > "$raw" || return 1
+    cmp -s "$prepared" "$raw" || return 1
+    working="$PROJECT_ROOT/$path"
+    [ -f "$working" ] && cmp -s "$prepared" "$working" || return 1
+  done
+}
+
+validate_recovery_answer() {
+  local path="$1" id="$2" first provider_value prompt_sha separator actual_sha
+  [ -f "$path" ] || return 1
+  IFS= read -r first < "$path" || return 1
+  [ "$first" = "# Answer — $id" ] || return 1
+  provider_value="$(awk '/^---$/ {exit} /^provider: / {sub(/^provider: /, ""); print; exit}' "$path")"
+  case "$provider_value" in claude|codex) :;; *) return 1;; esac
+  prompt_sha="$(awk '/^---$/ {exit} /^prompt_sha256: / {sub(/^prompt_sha256: /, ""); print; exit}' "$path")"
+  printf '%s' "$prompt_sha" | grep -Eq '^[0-9a-f]{64}$' || return 1
+  separator="$(awk '$0 == "---" {print NR; exit}' "$path")"
+  printf '%s' "$separator" | grep -Eq '^[1-9][0-9]*$' || return 1
+  tail -n "+$((separator + 1))" "$path" > "$raw" || return 1
+  actual_sha="$(sha256_file "$raw")" || return 1
+  [ "$actual_sha" = "$prompt_sha" ]
+}
+
+capture_answer() {
+  local id="$1" smoke nonce_sha
+  local answer="$PROJECT_ROOT/log/decisions/$id.answer.md"
+  local recovery="$PROJECT_ROOT/log/decisions/$id.answer.pending.md" sha session turn commit
+  cp "$PROJECT_ROOT/log/pending-decision.yaml" "$pending_backup"
+  recovery_build="$recovery.building"
+  if [ -e "$recovery" ] && [ -e "$recovery_build" ]; then
+    state_fail "정식 recovery와 building recovery가 동시에 존재합니다"
+  fi
+  smoke="$(yq -r '.smoke // false' "$PROJECT_ROOT/log/pending-decision.yaml")"
+  if [ "$smoke" = true ]; then
+    nonce_sha="$(native_smoke_nonce_sha256)" || state_fail "smoke nonce가 없음"
+    [ "$nonce_sha" = "$(yq -r '.nonce_sha256 // ""' "$PROJECT_ROOT/log/pending-decision.yaml")" ] \
+      || state_fail "smoke nonce가 pending과 다름"
+  fi
+  if [ -f "$recovery" ]; then
+    validate_recovery_answer "$recovery" "$id" || state_fail "recovery answer 구조 또는 SHA가 유효하지 않습니다"
+  else
+    if [ ! -e "$recovery_build" ]; then
+      yq -r '.prompt | @base64' "$input" | decode_base64 > "$raw"
+      sha="$(sha256_file "$raw")"
+      session="$(yq -r '.session_id // ""' "$input")"
+      turn="$(yq -r '.turn_id // ""' "$input")"
+      {
+        echo "# Answer — $id"
+        echo
+        echo "received_at: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+        echo "provider: $provider"
+        echo "session_id: $session"
+        echo "turn_id: $turn"
+        echo "prompt_sha256: $sha"
+        [ -n "${nonce_sha:-}" ] && echo "nonce_sha256: $nonce_sha"
+        echo '---'
+        cat "$raw"
+      } > "$recovery_build"
+    fi
+    validate_recovery_answer "$recovery_build" "$id" \
+      || state_fail "building recovery answer 구조 또는 SHA가 유효하지 않습니다"
+    mv -f "$recovery_build" "$recovery"
+  fi
+  assert_commit_noninteractive
+  capture_id="$id"; capture_base="$(git -C "$PROJECT_ROOT" rev-parse HEAD)"
+  prepared_answer="$(mktemp "${TMPDIR:-/tmp}/harness-answer-prepared.XXXXXX")"
+  prepared_pending="$(mktemp "${TMPDIR:-/tmp}/harness-pending-prepared.XXXXXX")"
+  cp "$recovery" "$prepared_answer"
+  cp "$pending_backup" "$prepared_pending"
+  yq -i '.status = "answer_captured"' "$prepared_pending"
+  yq -e '.status == "answer_captured"' "$prepared_pending" >/dev/null
+  capture_inflight=1
+  cp "$prepared_answer" "$answer"
+  cp "$prepared_pending" "$PROJECT_ROOT/log/pending-decision.yaml"
+  validate_state working
+  assert_index_clean
+  git -C "$PROJECT_ROOT" add -- log/pending-decision.yaml "log/decisions/$id.answer.md"
+  if ! GIT_TERMINAL_PROMPT=0 git -C "$PROJECT_ROOT" commit -m "chore(harness): capture decision $id" \
+      >/dev/null 2>"$git_error"; then
+    rollback_capture
+    block
+  fi
+  if ! verify_prepared_capture; then
+    state_fail "pre-commit hook이 answer 또는 pending을 변경했습니다"
+  fi
+  rm -f "$recovery"
+  capture_inflight=0
+  validate_state
+  commit="$(git -C "$PROJECT_ROOT" rev-parse --short HEAD)"
+  emit_context "$id" "$commit"
+}
+
+handle_prompt() {
+  local id status
+  [ -f "$PROJECT_ROOT/log/pending-decision.yaml" ] || { echo '{}'; return 0; }
+  acquire_lock || block
+  id="$(yq -r '.id' "$PROJECT_ROOT/log/pending-decision.yaml")"
+  status="$(yq -r '.status' "$PROJECT_ROOT/log/pending-decision.yaml")"
+  if [ "$status" = answer_captured ] \
+      && ! git -C "$PROJECT_ROOT" diff --quiet HEAD -- log/pending-decision.yaml \
+        "log/decisions/$id.answer.md"; then
+    git -C "$PROJECT_ROOT" show HEAD:log/pending-decision.yaml > "$pending_backup"
+    prepared_answer="$(mktemp "${TMPDIR:-/tmp}/harness-answer-prepared.XXXXXX")"
+    cp "$PROJECT_ROOT/log/decisions/$id.answer.md" "$prepared_answer"
+    capture_id="$id"; capture_base="$(git -C "$PROJECT_ROOT" rev-parse HEAD)"; capture_inflight=1
+    rollback_capture
+    status="$(yq -r '.status' "$PROJECT_ROOT/log/pending-decision.yaml")"
+  fi
+  case "$status" in
+    awaiting_answer) capture_answer "$id";;
+    answer_captured) emit_context "$id" "$(git -C "$PROJECT_ROOT" rev-parse --short HEAD)";;
+    *) block;;
+  esac
+}
+
+handle_stop() {
+  local id status message="$raw"
+  yq -r '.last_assistant_message // "" | @base64' "$input" | decode_base64 > "$message"
+  if [ -f "$PROJECT_ROOT/log/pending-decision.yaml" ]; then
+    id="$(yq -r '.id' "$PROJECT_ROOT/log/pending-decision.yaml")"
+    status="$(yq -r '.status' "$PROJECT_ROOT/log/pending-decision.yaml")"
+    [ "$status" = awaiting_answer ] || block_close
+    grep -Fq "결정 ID: $id" "$message" || block
+    git -C "$PROJECT_ROOT" diff --quiet HEAD -- log/pending-decision.yaml \
+      "log/decisions/$id.request.md" || block
+    [ -z "$(git -C "$PROJECT_ROOT" status --porcelain)" ] || block
+    echo '{}'; return 0
+  fi
+  ! grep -Eq '결정 ID: D-[0-9]{8}-[0-9]{6}-[0-9]{2}' "$message" || block
+  if tail -n 8 "$message" | grep -Eq '([?？][[:space:]]*$|까요[?？]?$|습니까[?？]?$|나요[?？]?$|할래요[?？]?$)'; then block; fi
+  echo '{}'
+}
+
+case "$event" in
+  UserPromptSubmit) handle_prompt;;
+  Stop) handle_stop;;
+  *) block;;
+esac

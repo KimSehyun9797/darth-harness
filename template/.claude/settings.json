@@ -1,0 +1,41 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ROOT=\"${CLAUDE_PROJECT_DIR}\"; test -x \"$ROOT/.harness/bin/decision-hook\" || { echo 'decision-hook missing' >&2; exit 2; }; exec \"$ROOT/.harness/bin/decision-hook\" claude",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "ROOT=\"${CLAUDE_PROJECT_DIR}\"; test -x \"$ROOT/.harness/bin/live-status-hook\" && \"$ROOT/.harness/bin/live-status-hook\" claude || true",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "ROOT=\"${CLAUDE_PROJECT_DIR}\"; LAUNCHER=\"$HOME/.local/bin/agent-harness-live-status\"; test -n \"$ROOT\" && test -x \"$LAUNCHER\" && \"$LAUNCHER\" start \"$ROOT\" claude >/dev/null 2>&1 || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ROOT=\"${CLAUDE_PROJECT_DIR}\"; test -x \"$ROOT/.harness/bin/decision-hook\" || { echo 'decision-hook missing' >&2; exit 2; }; exec \"$ROOT/.harness/bin/decision-hook\" claude",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "ROOT=\"${CLAUDE_PROJECT_DIR}\"; test -x \"$ROOT/.harness/bin/live-status-hook\" && \"$ROOT/.harness/bin/live-status-hook\" claude || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

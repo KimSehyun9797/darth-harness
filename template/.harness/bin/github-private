@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# Preview and perform a private-only first GitHub push for one harness project.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  .harness/bin/github-private plan [--repo OWNER/NAME]
+  .harness/bin/github-private apply --confirm SHA256 [--repo OWNER/NAME]
+EOF
+}
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 2
+}
+
+[ "$#" -gt 0 ] || { usage >&2; exit 2; }
+MODE="$1"
+shift
+case "$MODE" in
+  plan|apply) ;;
+  --help|-h) usage; exit 0 ;;
+  *) die "mode must be plan or apply" ;;
+esac
+
+REPOSITORY=''
+CONFIRM=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --repo)
+      [ "$#" -ge 2 ] || die "--repo requires OWNER/NAME"
+      REPOSITORY="$2"
+      shift 2
+      ;;
+    --confirm)
+      [ "$#" -ge 2 ] || die "--confirm requires SHA256"
+      CONFIRM="$2"
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+
+[ "$MODE" = apply ] || [ -z "$CONFIRM" ] || die "--confirm is valid only with apply"
+[ "$MODE" = plan ] || [ -n "$CONFIRM" ] || die "apply requires --confirm SHA256"
+
+command -v git >/dev/null 2>&1 || die "git is required"
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "run inside a Git repository"
+cd "$ROOT"
+git rev-parse --verify HEAD >/dev/null 2>&1 || die "the project needs a commit before planning a push"
+[ -z "$(git status --porcelain)" ] || die "working tree is not clean; commit or exclude every file before planning"
+command -v gh >/dev/null 2>&1 || die "GitHub CLI (gh) is required"
+gh auth status >/dev/null 2>&1 || die "GitHub CLI is not logged in"
+
+if [ -z "$REPOSITORY" ]; then
+  OWNER="$(gh api user --jq .login 2>/dev/null)" || die "could not read the authenticated GitHub login"
+  [ -n "$OWNER" ] || die "authenticated GitHub login is empty"
+  REPOSITORY="$OWNER/$(basename "$ROOT")"
+fi
+
+case "$REPOSITORY" in
+  -*|*/*/*|/*|*/|'') die "repository must be OWNER/NAME" ;;
+esac
+OWNER="${REPOSITORY%%/*}"
+NAME="${REPOSITORY#*/}"
+case "$OWNER" in ''|*[!A-Za-z0-9-]*) die "invalid GitHub owner: $OWNER" ;; esac
+case "$NAME" in ''|'.'|'..'|*[!A-Za-z0-9._-]*) die "invalid GitHub repository name: $NAME" ;; esac
+
+REMOTE_STATE=absent
+REMOTE_HTTPS=''
+REMOTE_SSH=''
+load_remote() {
+  remote_output="$(gh repo view "$REPOSITORY" --json visibility,url,sshUrl \
+    --jq '.visibility, .url, .sshUrl' 2>/dev/null)" || return 1
+  visibility="$(printf '%s\n' "$remote_output" | sed -n '1p')"
+  REMOTE_HTTPS="$(printf '%s\n' "$remote_output" | sed -n '2p')"
+  REMOTE_SSH="$(printf '%s\n' "$remote_output" | sed -n '3p')"
+  [ "$visibility" = PRIVATE ] || die "existing repository is not private: $REPOSITORY ($visibility)"
+  [ -n "$REMOTE_HTTPS" ] && [ -n "$REMOTE_SSH" ] || die "GitHub returned incomplete remote URLs"
+  REMOTE_STATE=private
+}
+load_remote || true
+
+ORIGIN=missing
+if origin_value="$(git remote get-url origin 2>/dev/null)"; then
+  ORIGIN="$origin_value"
+  expected_https="https://github.com/$REPOSITORY"
+  expected_ssh="git@github.com:$REPOSITORY.git"
+  case "$ORIGIN" in
+    "$expected_https"|"$expected_https.git"|"$expected_ssh"|"$REMOTE_HTTPS"|"$REMOTE_HTTPS.git"|"$REMOTE_SSH") ;;
+    *) die "origin points somewhere else: $ORIGIN" ;;
+  esac
+fi
+
+COMMIT="$(git rev-parse HEAD)"
+TREE="$(git rev-parse 'HEAD^{tree}')"
+FILE_COUNT=0
+while IFS= read -r -d '' path; do
+  FILE_COUNT=$((FILE_COUNT + 1))
+done < <(git ls-tree -r --name-only -z HEAD)
+
+CONFIRM_SHA256="$(printf '%s\n' \
+  'github-private-plan-v1' \
+  "$REPOSITORY" \
+  PRIVATE \
+  "$REMOTE_STATE" \
+  "$ORIGIN" \
+  "$COMMIT" \
+  "$TREE" | shasum -a 256 | awk '{print $1}')"
+
+print_plan() {
+  printf 'REPOSITORY=%s\n' "$REPOSITORY"
+  printf 'VISIBILITY=PRIVATE\n'
+  printf 'REMOTE_STATE=%s\n' "$REMOTE_STATE"
+  printf 'ORIGIN=%s\n' "$ORIGIN"
+  printf 'COMMIT=%s\n' "$COMMIT"
+  printf 'TREE=%s\n' "$TREE"
+  printf 'FILES=%s\n' "$FILE_COUNT"
+  while IFS= read -r -d '' path; do
+    printf '  - %q\n' "$path"
+  done < <(git ls-tree -r --name-only -z HEAD)
+  printf 'CONFIRM_SHA256=%s\n' "$CONFIRM_SHA256"
+}
+
+if [ "$MODE" = plan ]; then
+  print_plan
+  exit 0
+fi
+
+case "$CONFIRM" in
+  *[!0-9a-f]*|'') die "confirmation must be a lowercase SHA-256" ;;
+esac
+[ "${#CONFIRM}" -eq 64 ] || die "confirmation must be a 64-character SHA-256"
+[ "$CONFIRM" = "$CONFIRM_SHA256" ] || die "plan changed; run plan again and review the new file list"
+
+if [ "$REMOTE_STATE" = absent ]; then
+  if gh repo create "$REPOSITORY" --private; then
+    :
+  else
+    create_status=$?
+    if ! load_remote; then
+      exit "$create_status"
+    fi
+  fi
+  load_remote || die "repository creation returned success but the private repository cannot be read"
+fi
+
+if [ "$ORIGIN" = missing ]; then
+  protocol="$(gh config get git_protocol --host github.com 2>/dev/null || printf 'https')"
+  case "$protocol" in
+    ssh) remote_url="$REMOTE_SSH" ;;
+    *) remote_url="$REMOTE_HTTPS" ;;
+  esac
+  if ! git remote add origin "$remote_url"; then
+    printf 'SYNC_PENDING: private repository exists; rerun plan and apply after fixing origin\n' >&2
+    exit 1
+  fi
+fi
+
+if git push -u origin HEAD; then
+  printf 'SYNCED_PRIVATE=%s\n' "$REPOSITORY"
+  printf 'PUSHED_COMMIT=%s\n' "$COMMIT"
+else
+  push_status=$?
+  printf 'SYNC_PENDING: private repository and origin are preserved; rerun plan and apply\n' >&2
+  exit "$push_status"
+fi

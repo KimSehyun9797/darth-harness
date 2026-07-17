@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# 워커 실행 래퍼 (B-001): started/finished 사건을 .runs에 기록하고 종료 코드를 전파한다.
+# 사용법: worker-wrap <runs파일> <run_id> <log파일> <prompt파일> -- <명령> [인자...]
+set -u
+usage="사용법: worker-wrap <runs파일> <run_id> <log파일> <prompt파일> -- <명령> [인자...]"
+[ "$#" -ge 6 ] || { echo "ERROR: $usage" >&2; exit 2; }
+RUNS="$1"; RUN_ID="$2"; LOG="$3"; PROMPT="$4"
+[ "$5" = "--" ] || { echo "ERROR: $usage" >&2; exit 2; }
+shift 5
+printf '%s' "$RUN_ID" | grep -Eq '^[A-Za-z0-9._-]+$' \
+  || { echo "ERROR: 안전하지 않은 run_id: $RUN_ID" >&2; exit 2; }
+[ -f "$PROMPT" ] || { echo "ERROR: prompt 파일 없음: $PROMPT" >&2; exit 2; }
+utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+live_update() {
+  writer="${HARNESS_PROJECT_ROOT:-}/.harness/bin/live-status"
+  [ -x "$writer" ] || return 0
+  HARNESS_PROJECT_ROOT="$HARNESS_PROJECT_ROOT" "$writer" "$@" >/dev/null 2>&1 || true
+}
+if ! printf 'run_id: %s event: started at: %s\n' "$RUN_ID" "$(utc)" >> "$RUNS"; then
+  echo "ERROR: started 사건 기록 실패: $RUNS" >&2
+  exit 1
+fi
+live_update worker-update --run-id "$RUN_ID" --state running --updated-at "$(date +%s)"
+"$@" < "$PROMPT" 2>&1 | tee -a "$LOG"
+pipe_rc=("${PIPESTATUS[@]}")
+rc="${pipe_rc[0]}"
+if [ "${pipe_rc[1]}" -ne 0 ]; then
+  echo "ERROR: 워커 로그 기록 실패: $LOG" >&2
+  [ "$rc" -ne 0 ] || rc=1
+fi
+finish_epoch="$(date +%s)"
+if ! printf 'run_id: %s event: finished at: %s exit_code: %s\n' \
+    "$RUN_ID" "$(utc)" "$rc" >> "$RUNS"; then
+  echo "ERROR: finished 사건 기록 실패: $RUNS" >&2
+  exit 1
+fi
+live_update worker-finish --run-id "$RUN_ID" --finished-at "$finish_epoch"
+exit "$rc"

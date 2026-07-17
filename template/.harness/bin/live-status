@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# 프로젝트 로컬 원자적 상태 기록기. 파일을 source하지 않고 허용된 키만 데이터로 쓴다.
+# 값은 명시한 CLI 플래그로만 들어온다. 모델·태스크·스킬을 추측하지 않는다.
+set -u
+
+ROOT="${HARNESS_PROJECT_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || true)}"
+[ -n "$ROOT" ] || { echo 'ERROR: project root unavailable' >&2; exit 2; }
+DIR="$ROOT/.harness"
+WORKERS="$DIR/live-workers"
+umask 077
+
+# 검증을 통과한 값은 개행을 포함할 수 없으므로 이 sentinel과 절대 같을 수 없다.
+UNSET=$'\n__unset__'
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
+
+safe_id() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9._:-]+$'; }
+safe_text() {
+  [ "${#1}" -le 512 ] || return 1
+  case "$1" in *$'\n'*|*$'\r'*) return 1;; esac
+  return 0
+}
+safe_pct() { [ "$1" = '?' ] || { printf '%s' "$1" | grep -Eq '^[0-9]{1,3}$' && [ "$1" -le 100 ]; }; }
+safe_epoch() { [ "$1" = '?' ] || printf '%s' "$1" | grep -Eq '^[0-9]{1,12}$'; }
+safe_decimal() {
+  [ "$1" = '?' ] || { [ "${#1}" -le 32 ] && printf '%s' "$1" | grep -Eq '^[0-9]+([.][0-9]+)?$'; }
+}
+safe_signed_decimal() {
+  [ "$1" = '?' ] || { [ "${#1}" -le 33 ] && printf '%s' "$1" | grep -Eq '^-?[0-9]+([.][0-9]+)?$'; }
+}
+safe_bool() { case "$1" in true|false|'?') return 0;; *) return 1;; esac; }
+safe_route() { case "$1" in weekly|credits|unavailable|'?') return 0;; *) return 1;; esac; }
+# id 또는 미상('?')만 허용하는 참조값 검증기.
+refok() { [ "$1" = '?' ] || safe_id "$1"; }
+
+read_key() {
+  awk -F= -v k="$2" '$1 == k {sub(/^[^=]*=/, ""); print; exit}' "$1" 2>/dev/null || true
+}
+
+publish() {
+  target="$1"
+  mkdir -p "$DIR" "$WORKERS" || return 1
+  chmod 700 "$DIR" "$WORKERS" || return 1
+  tmp="$(mktemp "$target.tmp.XXXXXX")" || return 1
+  trap 'rm -f "$tmp"' EXIT HUP INT TERM
+  cat > "$tmp" || return 1
+  chmod 600 "$tmp" || return 1
+  mv "$tmp" "$target" || return 1
+  trap - EXIT HUP INT TERM
+}
+
+# 플래그 값이 있으면 그것을, 없으면 기존 레코드의 허용 키를, 그것도 없으면 '?'를 쓴다.
+emit_field() { # $1=flag-value-or-UNSET $2=KEY $3=record-file
+  local v="$1"
+  if [ "$v" = "$UNSET" ]; then
+    v="$(read_key "$3" "$2")"
+  fi
+  [ -n "$v" ] || v='?'
+  printf '%s=%s\n' "$2" "$v"
+}
+
+cmd_orchestrator_update() {
+  target="$DIR/live-status.env"
+  o_pid=$UNSET; o_run=$UNSET; o_prov=$UNSET; o_mreq=$UNSET; o_mobs=$UNSET
+  o_surf=$UNSET; o_phase=$UNSET; o_task=$UNSET; o_skills=$UNSET
+  o_ctxp=$UNSET; o_ctx=$UNSET; o_wkp=$UNSET; o_wreset=$UNSET
+  o_credit=$UNSET; o_delta=$UNSET; o_cavail=$UNSET; o_route=$UNSET; o_capt=$UNSET
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project-id) shift; v="${1:-}"; safe_text "$v" || die "project-id"; o_pid="$v";;
+      --run-id) shift; v="${1:-}"; refok "$v" || die "run-id"; o_run="$v";;
+      --provider) shift; v="${1:-}"; refok "$v" || die "provider"; o_prov="$v";;
+      --model-requested) shift; v="${1:-}"; safe_text "$v" || die "model-requested"; o_mreq="$v";;
+      --model-observed) shift; v="${1:-}"; safe_text "$v" || die "model-observed"; o_mobs="$v";;
+      --surface) shift; v="${1:-}"; refok "$v" || die "surface"; o_surf="$v";;
+      --phase) shift; v="${1:-}"; safe_text "$v" || die "phase"; o_phase="$v";;
+      --task) shift; v="${1:-}"; safe_text "$v" || die "task"; o_task="$v";;
+      --skills) shift; v="${1:-}"; safe_text "$v" || die "skills"; o_skills="$v";;
+      --context-left-pct) shift; v="${1:-}"; safe_pct "$v" || die "context-left-pct"; o_ctxp="$v";;
+      --context-left) shift; v="${1:-}"; safe_text "$v" || die "context-left"; o_ctx="$v";;
+      --weekly-left-pct) shift; v="${1:-}"; safe_pct "$v" || die "weekly-left-pct"; o_wkp="$v";;
+      --weekly-resets-at) shift; v="${1:-}"; safe_epoch "$v" || die "weekly-resets-at"; o_wreset="$v";;
+      --credits-balance) shift; v="${1:-}"; safe_decimal "$v" || die "credits-balance"; o_credit="$v";;
+      --credits-delta) shift; v="${1:-}"; safe_signed_decimal "$v" || die "credits-delta"; o_delta="$v";;
+      --credits-available) shift; v="${1:-}"; safe_bool "$v" || die "credits-available"; o_cavail="$v";;
+      --billing-route) shift; v="${1:-}"; safe_route "$v" || die "billing-route"; o_route="$v";;
+      --captured-at) shift; v="${1:-}"; safe_epoch "$v" || die "captured-at"; o_capt="$v";;
+      *) die "unknown flag: $1";;
+    esac
+    shift
+  done
+  {
+    printf 'HARNESS_STATUS_VERSION=2\n'
+    emit_field "$o_pid"    HARNESS_PROJECT_ID                   "$target"
+    emit_field "$o_run"    HARNESS_ORCHESTRATOR_RUN_ID          "$target"
+    emit_field "$o_prov"   HARNESS_ORCHESTRATOR_PROVIDER        "$target"
+    emit_field "$o_mreq"   HARNESS_ORCHESTRATOR_MODEL_REQUESTED "$target"
+    emit_field "$o_mobs"   HARNESS_ORCHESTRATOR_MODEL_OBSERVED  "$target"
+    emit_field "$o_surf"   HARNESS_ORCHESTRATOR_SURFACE         "$target"
+    emit_field "$o_phase"  HARNESS_ORCHESTRATOR_PHASE           "$target"
+    emit_field "$o_task"   HARNESS_ORCHESTRATOR_TASK            "$target"
+    emit_field "$o_skills" HARNESS_ORCHESTRATOR_ACTIVE_SKILLS   "$target"
+    emit_field "$o_ctxp"   HARNESS_CONTEXT_REMAINING_PCT        "$target"
+    emit_field "$o_ctx"    HARNESS_CONTEXT_REMAINING            "$target"
+    emit_field "$o_wkp"    HARNESS_WEEKLY_REMAINING_PCT         "$target"
+    emit_field "$o_wreset" HARNESS_WEEKLY_RESETS_AT             "$target"
+    emit_field "$o_credit" HARNESS_CODEX_CREDITS_BALANCE        "$target"
+    emit_field "$o_delta"  HARNESS_CODEX_CREDITS_DELTA          "$target"
+    emit_field "$o_cavail" HARNESS_CODEX_CREDITS_AVAILABLE      "$target"
+    emit_field "$o_route"  HARNESS_CODEX_BILLING_ROUTE          "$target"
+    emit_field "$o_capt"   HARNESS_CAPTURED_AT                  "$target"
+  } | publish "$target"
+}
+
+worker_reset() {
+  f_run=$UNSET; f_prun=$UNSET; f_psurf=$UNSET; f_prov=$UNSET
+  f_mreq=$UNSET; f_mobs=$UNSET; f_role=$UNSET; f_task=$UNSET
+  f_work=$UNSET; f_reqsk=$UNSET; f_skills=$UNSET; f_state=$UNSET
+  f_surf=$UNSET; f_start=$UNSET; f_upd=$UNSET; f_finish=$UNSET
+}
+
+# worker-init/worker-update가 공유하는 플래그 파서. finished-at는 worker-finish 전용이다.
+parse_worker_flags() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --run-id) shift; v="${1:-}"; safe_id "$v" || die "run-id"; f_run="$v";;
+      --parent-run-id) shift; v="${1:-}"; refok "$v" || die "parent-run-id"; f_prun="$v";;
+      --parent-surface) shift; v="${1:-}"; refok "$v" || die "parent-surface"; f_psurf="$v";;
+      --provider) shift; v="${1:-}"; refok "$v" || die "provider"; f_prov="$v";;
+      --model-requested) shift; v="${1:-}"; safe_text "$v" || die "model-requested"; f_mreq="$v";;
+      --model-observed) shift; v="${1:-}"; safe_text "$v" || die "model-observed"; f_mobs="$v";;
+      --role) shift; v="${1:-}"; safe_text "$v" || die "role"; f_role="$v";;
+      --task-id) shift; v="${1:-}"; refok "$v" || die "task-id"; f_task="$v";;
+      --work) shift; v="${1:-}"; safe_text "$v" || die "work"; f_work="$v";;
+      --required-skills) shift; v="${1:-}"; safe_text "$v" || die "required-skills"; f_reqsk="$v";;
+      --skills) shift; v="${1:-}"; safe_text "$v" || die "skills"; f_skills="$v";;
+      --state) shift; v="${1:-}"; refok "$v" || die "state"; f_state="$v";;
+      --surface) shift; v="${1:-}"; refok "$v" || die "surface"; f_surf="$v";;
+      --started-at) shift; v="${1:-}"; safe_epoch "$v" || die "started-at"; f_start="$v";;
+      --updated-at) shift; v="${1:-}"; safe_epoch "$v" || die "updated-at"; f_upd="$v";;
+      *) die "unknown flag: $1";;
+    esac
+    shift
+  done
+}
+
+emit_worker() { # $1=target record
+  {
+    printf 'HARNESS_WORKER_STATUS_VERSION=1\n'
+    emit_field "$f_run"    HARNESS_WORKER_RUN_ID          "$1"
+    emit_field "$f_prun"   HARNESS_WORKER_PARENT_RUN_ID   "$1"
+    emit_field "$f_psurf"  HARNESS_WORKER_PARENT_SURFACE  "$1"
+    emit_field "$f_prov"   HARNESS_WORKER_PROVIDER        "$1"
+    emit_field "$f_mreq"   HARNESS_WORKER_MODEL_REQUESTED "$1"
+    emit_field "$f_mobs"   HARNESS_WORKER_MODEL_OBSERVED  "$1"
+    emit_field "$f_role"   HARNESS_WORKER_ROLE            "$1"
+    emit_field "$f_task"   HARNESS_WORKER_TASK_ID         "$1"
+    emit_field "$f_work"   HARNESS_WORKER_CURRENT_WORK    "$1"
+    emit_field "$f_reqsk"  HARNESS_WORKER_REQUIRED_SKILLS "$1"
+    emit_field "$f_skills" HARNESS_WORKER_ACTIVE_SKILLS   "$1"
+    emit_field "$f_state"  HARNESS_WORKER_STATE           "$1"
+    emit_field "$f_surf"   HARNESS_WORKER_SURFACE         "$1"
+    emit_field "$f_start"  HARNESS_WORKER_STARTED_AT      "$1"
+    emit_field "$f_upd"    HARNESS_WORKER_UPDATED_AT      "$1"
+    emit_field "$f_finish" HARNESS_WORKER_FINISHED_AT     "$1"
+  } | publish "$1"
+}
+
+cmd_worker_init() {
+  worker_reset
+  parse_worker_flags "$@"
+  [ "$f_run" != "$UNSET" ] || die "worker-init needs --run-id"
+  [ "$f_state" != "$UNSET" ] || f_state=starting
+  emit_worker "$WORKERS/$f_run.env"
+}
+
+cmd_worker_update() {
+  worker_reset
+  parse_worker_flags "$@"
+  [ "$f_run" != "$UNSET" ] || die "worker-update needs --run-id"
+  target="$WORKERS/$f_run.env"
+  [ -f "$target" ] || die "no worker record: $f_run"
+  emit_worker "$target"
+}
+
+cmd_worker_finish() {
+  worker_reset
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --run-id) shift; v="${1:-}"; safe_id "$v" || die "run-id"; f_run="$v";;
+      --finished-at) shift; v="${1:-}"; safe_epoch "$v" || die "finished-at"; f_finish="$v";;
+      *) die "unknown flag: $1";;
+    esac
+    shift
+  done
+  [ "$f_run" != "$UNSET" ] || die "worker-finish needs --run-id"
+  if [ "$f_finish" = "$UNSET" ] || [ "$f_finish" = '?' ]; then die "worker-finish needs integer --finished-at"; fi
+  target="$WORKERS/$f_run.env"
+  [ -f "$target" ] || die "no worker record: $f_run"
+  f_state="done"
+  f_upd="$f_finish"
+  emit_worker "$target"
+}
+
+cmd_worker_gc() {
+  now=$UNSET
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --now) shift; v="${1:-}"; safe_epoch "$v" || die "now"; now="$v";;
+      *) die "unknown flag: $1";;
+    esac
+    shift
+  done
+  if [ "$now" = "$UNSET" ] || [ "$now" = '?' ]; then die "worker-gc needs integer --now"; fi
+  [ -d "$WORKERS" ] || return 0
+  for f in "$WORKERS"/*.env; do
+    [ -e "$f" ] || continue
+    st="$(read_key "$f" HARNESS_WORKER_STATE)"
+    fin="$(read_key "$f" HARNESS_WORKER_FINISHED_AT)"
+    [ "$st" = "done" ] || continue
+    printf '%s' "$fin" | grep -Eq '^[0-9]{1,12}$' || continue
+    if [ $((now - fin)) -ge 60 ]; then rm -f "$f"; fi
+  done
+  return 0
+}
+
+cmd="${1:-}"
+[ $# -gt 0 ] && shift
+case "$cmd" in
+  orchestrator-update) cmd_orchestrator_update "$@";;
+  worker-init) cmd_worker_init "$@";;
+  worker-update) cmd_worker_update "$@";;
+  worker-finish) cmd_worker_finish "$@";;
+  worker-gc) cmd_worker_gc "$@";;
+  *) die "unknown command: $cmd";;
+esac

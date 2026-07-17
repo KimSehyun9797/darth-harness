@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# 추적된 로드맵을 검증해 상태판이 읽는 비공개 스냅샷으로 게시한다.
+set -u
+
+ROOT="${HARNESS_PROJECT_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || true)}"
+[ -n "$ROOT" ] || { printf 'ERROR: project root unavailable\n' >&2; exit 2; }
+TARGET="$ROOT/.harness/live-roadmap.yaml"
+umask 077
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
+safe_epoch() { printf '%s' "$1" | grep -Eq '^[0-9]{1,12}$'; }
+safe_id() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9._:-]+$'; }
+
+cmd="${1:-}"
+[ $# -gt 0 ] && shift
+[ "$cmd" = publish ] || die "unknown command: $cmd"
+now=''
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --now)
+      [ $# -ge 2 ] || die "--now needs a value"
+      now="$2"
+      shift 2
+      ;;
+    *) die "unknown flag: $1";;
+  esac
+done
+if [ -z "$now" ] || ! safe_epoch "$now"; then
+  die "publish needs integer --now"
+fi
+command -v yq >/dev/null 2>&1 || die "yq v4 is required"
+
+source_kind=roadmap
+SOURCE="$ROOT/ROADMAP.yaml"
+if [ ! -f "$SOURCE" ]; then
+  source_kind=tasks
+  SOURCE="$ROOT/tasks.yaml"
+fi
+[ -f "$SOURCE" ] || die "ROADMAP.yaml or tasks.yaml not found"
+
+roadmap_shape_ok() {
+  yq -e '
+    (.version | tag) == "!!int" and .version == 1 and
+    (.project | tag) == "!!map" and
+    (.project.id | tag) == "!!str" and
+    (.project.id | test("^[A-Za-z0-9._:-]+$")) and
+    (.project.name | tag) == "!!str" and (.project.name | length) <= 512 and
+    (.project.name | test("^[^\\r\\n\\t]*$")) and
+    (.project.purpose | tag) == "!!str" and (.project.purpose | length) <= 512 and
+    (.project.purpose | test("^[^\\r\\n\\t]*$")) and
+    (.items | tag) == "!!seq" and (.items | length) <= 99 and
+    ([.items[] | select(
+      ((tag) != "!!map") or
+      ((.id | tag) != "!!str") or (.id | test("^[A-Za-z0-9._:-]+$") | not) or
+      ((.title | tag) != "!!str") or ((.title | length) > 512) or (.title | test("^[^\\r\\n\\t]*$") | not) or
+      ((.state | tag) != "!!str") or
+      (.state != "done" and .state != "running" and .state != "reviewing" and .state != "blocked" and .state != "pending" and .state != "hold" and .state != "skipped") or
+      (((((.progress_pct | tag) == "!!int") and .progress_pct >= 0 and .progress_pct <= 100) or .progress_pct == "?") | not) or
+      ((.state == "done" or .state == "skipped") and .progress_pct != 100) or
+      ((.state == "pending" or .state == "hold") and .progress_pct != 0) or
+      ((.children | tag) != "!!seq") or ((.children | length) > 6) or
+      ([.children[] | select(
+        ((tag) != "!!map") or
+        ((.title | tag) != "!!str") or ((.title | length) > 512) or (.title | test("^[^\\r\\n\\t]*$") | not) or
+        ((.state | tag) != "!!str") or
+        (.state != "done" and .state != "running" and .state != "reviewing" and .state != "blocked" and .state != "pending" and .state != "hold" and .state != "skipped")
+      )] | length > 0)
+    )] | length) == 0 and
+    ([.items[].id] | length) == ([.items[].id] | unique | length)
+  ' "$SOURCE" >/dev/null 2>&1
+}
+
+tasks_shape_ok() {
+  yq -e '
+    (.tasks | tag) == "!!seq" and (.tasks | length) <= 99 and
+    ([.tasks[] | select(
+      ((tag) != "!!map") or
+      ((.id | tag) != "!!str") or (.id | test("^[A-Za-z0-9._:-]+$") | not) or
+      ((.name | tag) != "!!str") or ((.name | length) > 512) or (.name | test("^[^\\r\\n\\t]*$") | not) or
+      ((.status | tag) != "!!str")
+    )] | length) == 0 and
+    ([.tasks[].id] | length) == ([.tasks[].id] | unique | length)
+  ' "$SOURCE" >/dev/null 2>&1
+}
+
+if [ "$source_kind" = roadmap ]; then
+  roadmap_shape_ok || die "invalid ROADMAP.yaml"
+else
+  tasks_shape_ok || die "invalid tasks.yaml fallback"
+fi
+
+mkdir -p "$ROOT/.harness" || die "cannot create runtime directory"
+chmod 700 "$ROOT/.harness" || die "cannot protect runtime directory"
+tmp="$(mktemp "$TARGET.tmp.XXXXXX")" || die "cannot create temporary snapshot"
+trap 'rm -f "$tmp"' EXIT HUP INT TERM
+
+if [ "$source_kind" = roadmap ]; then
+  CAPTURED_AT="$now" yq -o=yaml '
+    {
+      "version": 1,
+      "project": {
+        "id": .project.id,
+        "name": .project.name,
+        "purpose": .project.purpose
+      },
+      "captured_at": env(CAPTURED_AT),
+      "items": [.items[] | {
+        "id": .id,
+        "title": .title,
+        "state": .state,
+        "progress_pct": .progress_pct,
+        "children": [.children[] | {"title": .title, "state": .state}]
+      }]
+    }
+  ' "$SOURCE" > "$tmp" || die "cannot normalize ROADMAP.yaml"
+else
+  project_id="$(awk -F= '$1 == "HARNESS_PROJECT_ID" {sub(/^[^=]*=/, ""); print; exit}' "$ROOT/.harness/live-status.env" 2>/dev/null || true)"
+  [ -n "$project_id" ] || project_id="$(basename "$ROOT")"
+  safe_id "$project_id" || die "unsafe fallback project id"
+  CAPTURED_AT="$now" PROJECT_ID="$project_id" yq -o=yaml '
+    {
+      "version": 1,
+      "project": {"id": strenv(PROJECT_ID), "name": strenv(PROJECT_ID), "purpose": "?"},
+      "captured_at": env(CAPTURED_AT),
+      "items": [.tasks[] | {
+        "id": .id,
+        "title": .name,
+        "state": .status,
+        "progress_pct": 0,
+        "children": []
+      }]
+    } |
+    ((.items[] | select(.state == "done" or .state == "verified" or .state == "skipped").progress_pct) = 100) |
+    ((.items[] | select(.state == "running" or .state == "failed" or .state == "blocked").progress_pct) = "?") |
+    ((.items[] | select(.state == "verified" or .state == "skipped").state) = "done") |
+    ((.items[] | select(.state == "failed").state) = "blocked") |
+    ((.items[] | select(.state != "done" and .state != "running" and .state != "blocked").state) = "pending")
+  ' "$SOURCE" > "$tmp" || die "cannot normalize tasks.yaml"
+fi
+
+chmod 600 "$tmp" || die "cannot protect roadmap snapshot"
+mv "$tmp" "$TARGET" || die "cannot publish roadmap snapshot"
+trap - EXIT HUP INT TERM

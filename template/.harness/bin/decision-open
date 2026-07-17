@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=template/.harness/lib/state.sh
+. "$BIN_DIR/../lib/state.sh"
+
+id="${1:?사용법: .harness/bin/decision-open <decision-id> <claude|codex>}"
+provider="${2:?사용법: .harness/bin/decision-open <decision-id> <claude|codex> [--smoke]}"
+mode="${3:-normal}"
+printf '%s' "$id" | grep -Eq '^D-[0-9]{8}-[0-9]{6}-[0-9]{2}$' \
+  || state_fail "decision id 형식 오류"
+case "$provider" in claude|codex) :;; *) state_fail "provider는 claude|codex";; esac
+nonce_sha=""
+case "$mode" in
+  normal) require_provider_ready "$provider";;
+  --smoke) nonce_sha="$(native_smoke_nonce_sha256)" || state_fail "smoke에는 안전한 HARNESS_NATIVE_SMOKE_NONCE가 필요합니다";;
+  *) state_fail "세 번째 인자는 --smoke만 허용";;
+esac
+[ ! -f "$PROJECT_ROOT/log/pending-decision.yaml" ] || state_fail "열린 결정이 이미 있습니다"
+request="log/decisions/$id.request.md"
+[ -s "$PROJECT_ROOT/$request" ] || state_fail "요청 파일 없음: $request"
+section_body "$PROJECT_ROOT/STATUS.md" '## 다음 사용자 결정' | grep -Fq "결정 ID: $id" \
+  || state_fail "STATUS에 같은 decision id를 먼저 기록하세요"
+section_body "$PROJECT_ROOT/log/HANDOFF.md" '## 열린 결정' | grep -Fq "결정 ID: $id" \
+  || state_fail "HANDOFF에 같은 decision id를 먼저 기록하세요"
+assert_index_clean
+assert_open_only "$id"
+base="$(git -C "$PROJECT_ROOT" rev-parse HEAD)"
+tmp="$PROJECT_ROOT/log/.pending-decision.$$.tmp"
+{
+  echo 'version: 1'
+  echo "id: $id"
+  echo 'status: awaiting_answer'
+  echo "opened_at: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  echo "opened_by: $provider"
+  echo "request_path: $request"
+  echo "answer_path: log/decisions/$id.answer.md"
+  echo "checkpoint_base: $base"
+  echo "smoke: $([ "$mode" = --smoke ] && echo true || echo false)"
+  [ -n "$nonce_sha" ] && echo "nonce_sha256: $nonce_sha"
+} > "$tmp"
+mv "$tmp" "$PROJECT_ROOT/log/pending-decision.yaml"
+validate_state working
+commit_paths "chore(harness): open decision $id" \
+  STATUS.md tasks.yaml log/HANDOFF.md log/pending-decision.yaml "$request"
+validate_state
+echo "$id"

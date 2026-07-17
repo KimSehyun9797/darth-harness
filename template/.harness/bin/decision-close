@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=template/.harness/lib/state.sh
+. "$BIN_DIR/../lib/state.sh"
+
+id="${1:?사용법: .harness/bin/decision-close <decision-id>}"
+pending="$PROJECT_ROOT/log/pending-decision.yaml"
+[ -f "$pending" ] || state_fail "열린 결정 없음"
+[ "$(yq -r '.id' "$pending")" = "$id" ] || state_fail "decision id 불일치"
+[ "$(yq -r '.status' "$pending")" = answer_captured ] || state_fail "답변이 아직 캡처되지 않음"
+answer="log/decisions/$id.answer.md"
+[ -f "$PROJECT_ROOT/$answer" ] || state_fail "answer 없음"
+git -C "$PROJECT_ROOT" log -1 --format=%H -- "$answer" | grep -Eq '^[0-9a-f]{40,64}$' \
+  || state_fail "answer 커밋 없음"
+section_body "$PROJECT_ROOT/STATUS.md" '## 다음 사용자 결정' | grep -Fq '(없음)' \
+  || state_fail "STATUS 결정을 먼저 닫으세요"
+section_body "$PROJECT_ROOT/log/HANDOFF.md" '## 열린 결정' | grep -Fq '(없음)' \
+  || state_fail "HANDOFF 결정을 먼저 닫으세요"
+assert_index_clean
+assert_open_only "$id"
+git -C "$PROJECT_ROOT" rm -- log/pending-decision.yaml
+set +e
+( set -e; validate_state working )
+validate_exit=$?
+set -e
+if [ "$validate_exit" -ne 0 ]; then
+  git -C "$PROJECT_ROOT" restore --staged -- log/pending-decision.yaml >/dev/null 2>&1 || true
+  git -C "$PROJECT_ROOT" restore -- log/pending-decision.yaml >/dev/null 2>&1 || true
+  state_fail "결정 종료 후 상태 검증 실패"
+fi
+if ! git -C "$PROJECT_ROOT" commit -m "chore(harness): close decision $id" -- \
+    STATUS.md tasks.yaml log/HANDOFF.md log/pending-decision.yaml; then
+  git -C "$PROJECT_ROOT" restore --staged -- STATUS.md tasks.yaml log/HANDOFF.md \
+    log/pending-decision.yaml >/dev/null 2>&1 || true
+  git -C "$PROJECT_ROOT" restore -- log/pending-decision.yaml >/dev/null 2>&1 || true
+  state_fail "결정 종료 커밋 실패"
+fi
+echo "decision closed: $id @ $(git -C "$PROJECT_ROOT" rev-parse --short HEAD)"
