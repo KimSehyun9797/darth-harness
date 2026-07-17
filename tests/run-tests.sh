@@ -3708,11 +3708,17 @@ t "live migration: 충돌 하나면 전체 apply를 부작용 없이 중단" 0 l
 
 install_enable_live_status_is_explicit_and_backup_safe() {
   home="$TMP/install-live-home"
-  mkdir -p "$home/.claude"
+  mkdir -p "$home/.claude" "$home/cmux-harness-status/bin" "$TMP/install-live-bin"
+  # CI처럼 cmux와 consumer가 없는 환경에서도 결정론적으로 돌도록 가짜를 둔다.
+  printf '#!/bin/sh\nexit 0\n' > "$home/cmux-harness-status/bin/cmux-harness-status"
+  chmod +x "$home/cmux-harness-status/bin/cmux-harness-status"
+  printf '#!/bin/sh\nexit 0\n' > "$TMP/install-live-bin/cmux"
+  chmod +x "$TMP/install-live-bin/cmux"
   cat > "$home/.claude/settings.json" <<'JSON'
 {"keep":"unchanged","statusLine":{"type":"command","command":"old-status-command","refreshInterval":17}}
 JSON
-  out="$(HOME="$home" bash "$ROOT/install.sh" --enable-live-status 2>&1)" || return 1
+  out="$(HOME="$home" PATH="$TMP/install-live-bin:$PATH" bash "$ROOT/install.sh" --enable-live-status 2>&1)" \
+    || return 1
   link="$home/.local/bin/cmux-harness-status"
   launcher="$home/.local/bin/agent-harness-live-status"
   [ -L "$link" ] || return 1
