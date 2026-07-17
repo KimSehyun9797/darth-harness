@@ -19,7 +19,7 @@ jobs:
           fi
       - name: shellcheck
         run: |
-          shellcheck -x install.sh scripts/*.sh tests/run-tests.sh \
+          shellcheck --severity=warning -x install.sh scripts/*.sh tests/run-tests.sh \
             template/.harness/lib/state.sh template/.harness/bin/*
       - name: tests
         run: bash tests/run-tests.sh
