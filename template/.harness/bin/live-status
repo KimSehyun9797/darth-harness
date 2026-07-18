@@ -89,6 +89,22 @@ cmd_orchestrator_update() {
     esac
     shift
   done
+  # 공급자가 바뀌면 이전 공급자의 모델·사용량·크레딧을 이어받지 않는다.
+  # 이번 호출에 명시된 값만 유지하고 나머지는 미상('?')으로 초기화한다.
+  old_prov="$(read_key "$target" HARNESS_ORCHESTRATOR_PROVIDER)"
+  if [ "$o_prov" != "$UNSET" ] && [ -n "$old_prov" ] && [ "$old_prov" != '?' ] \
+    && [ "$o_prov" != "$old_prov" ]; then
+    [ "$o_mreq" != "$UNSET" ]   || o_mreq='?'
+    [ "$o_mobs" != "$UNSET" ]   || o_mobs='?'
+    [ "$o_ctxp" != "$UNSET" ]   || o_ctxp='?'
+    [ "$o_ctx" != "$UNSET" ]    || o_ctx='?'
+    [ "$o_wkp" != "$UNSET" ]    || o_wkp='?'
+    [ "$o_wreset" != "$UNSET" ] || o_wreset='?'
+    [ "$o_credit" != "$UNSET" ] || o_credit='?'
+    [ "$o_delta" != "$UNSET" ]  || o_delta='?'
+    [ "$o_cavail" != "$UNSET" ] || o_cavail='?'
+    [ "$o_route" != "$UNSET" ]  || o_route='?'
+  fi
   {
     printf 'HARNESS_STATUS_VERSION=2\n'
     emit_field "$o_pid"    HARNESS_PROJECT_ID                   "$target"

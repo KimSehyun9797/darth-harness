@@ -2986,6 +2986,41 @@ live_status_orchestrator_is_atomic_and_private() {
   [ ! -e "$f.tmp" ]
 }
 t "live-status(orch): 원자적·비공개 기록" 0 live_status_orchestrator_is_atomic_and_private
+
+live_status_provider_switch_resets_usage() {
+  p="$TMP/live-orch-switch"
+  make_live_project "$p"
+  HARNESS_PROJECT_ROOT="$p" "$p/.harness/bin/live-status" orchestrator-update \
+    --run-id ORCH-SWITCH-01 --provider codex \
+    --model-requested gpt-5.3-codex --model-observed gpt-5.3-codex \
+    --phase implement --task 'switch source' --context-left-pct 14 \
+    --weekly-left-pct 0 --weekly-resets-at 1784780177 \
+    --credits-balance 0 --credits-delta 0.0 --credits-available false \
+    --billing-route unavailable --captured-at 1784044800 || return 1
+  # 공급자만 바꿔 갱신하면 이전 공급자의 모델·사용량·크레딧은 미상이 된다.
+  HARNESS_PROJECT_ROOT="$p" "$p/.harness/bin/live-status" orchestrator-update \
+    --provider claude --phase resume --captured-at 1784044900 || return 1
+  f="$p/.harness/live-status.env"
+  grep -Fx 'HARNESS_ORCHESTRATOR_PROVIDER=claude' "$f" >/dev/null || return 1
+  grep -Fx 'HARNESS_ORCHESTRATOR_MODEL_OBSERVED=?' "$f" >/dev/null || return 1
+  grep -Fx 'HARNESS_ORCHESTRATOR_MODEL_REQUESTED=?' "$f" >/dev/null || return 1
+  grep -Fx 'HARNESS_CONTEXT_REMAINING_PCT=?' "$f" >/dev/null || return 1
+  grep -Fx 'HARNESS_WEEKLY_REMAINING_PCT=?' "$f" >/dev/null || return 1
+  grep -Fx 'HARNESS_WEEKLY_RESETS_AT=?' "$f" >/dev/null || return 1
+  grep -Fx 'HARNESS_CODEX_CREDITS_BALANCE=?' "$f" >/dev/null || return 1
+  grep -Fx 'HARNESS_CODEX_BILLING_ROUTE=?' "$f" >/dev/null || return 1
+  # 공급자와 무관한 진행 정보는 유지된다.
+  grep -Fx 'HARNESS_ORCHESTRATOR_RUN_ID=ORCH-SWITCH-01' "$f" >/dev/null || return 1
+  # 같은 공급자로 다시 갱신하면 기존 값을 정상적으로 이어받는다.
+  HARNESS_PROJECT_ROOT="$p" "$p/.harness/bin/live-status" orchestrator-update \
+    --provider claude --context-left-pct 88 --captured-at 1784045000 || return 1
+  grep -Fx 'HARNESS_CONTEXT_REMAINING_PCT=88' "$f" >/dev/null || return 1
+  HARNESS_PROJECT_ROOT="$p" "$p/.harness/bin/live-status" orchestrator-update \
+    --provider claude --captured-at 1784045100 || return 1
+  grep -Fx 'HARNESS_CONTEXT_REMAINING_PCT=88' "$f" >/dev/null
+}
+t "live-status(orch): 공급자 전환 시 이전 사용량·모델을 이어받지 않음" 0 \
+  live_status_provider_switch_resets_usage
 LS="$ROOT/template/.harness/bin/live-status"
 t "live-status(orch): 범위 밖 퍼센트 101 거부" 2 bash -c \
   "HARNESS_PROJECT_ROOT='$TMP/live-rej1' '$LS' orchestrator-update --run-id R --provider codex --weekly-left-pct 101"
@@ -3372,6 +3407,9 @@ case "${1:-}" in
   identify) printf '{"caller":{"workspace_ref":"workspace:5","surface_ref":"surface:70"}}\n' ;;
   read-screen) [ "${STATUS_CMUX_STALE:-0}" != 1 ] ;;
   new-split) printf 'OK surface:94 workspace:5\n' ;;
+  list-panes) printf '* pane:7  [1 surface]\n' ;;
+  list-pane-surfaces) printf '* surface:94  live-status-session\n' ;;
+  resize-pane) exit 0 ;;
   send|send-key) exit 0 ;;
   *) exit 2 ;;
 esac
@@ -3404,6 +3442,8 @@ status_pane_start_reuses_and_stops() {
   PATH="$STATUS_PANE_PATH" STATUS_CMUX_LOG="$log" CODEX_THREAD_ID=thread-test \
     "$LSP" start "$p" codex || return 1
   [ "$(grep -c '^new-split down --workspace workspace:5$' "$log")" = 1 ] || return 1
+  # 높이 확보는 새 split에서 한 번만 — 재사용에서는 다시 resize하지 않는다.
+  [ "$(grep -c '^resize-pane --pane pane:7 --workspace workspace:5 -U --amount 100$' "$log")" = 1 ] || return 1
   PATH="$STATUS_PANE_PATH" STATUS_CMUX_LOG="$log" "$LSP" stop "$p" || return 1
   [ ! -e "$f" ] || return 1
   grep -Fq 'send-key --surface surface:94 ctrl-c' "$log"
@@ -3734,6 +3774,49 @@ JSON
   printf '%s\n' "$out" | grep -Fq "$ROOT/scripts/claude-statusline-tui.sh"
 }
 t "install --enable-live-status: consumer link·Claude 명령 backup·old/new 공개" 0 install_enable_live_status_is_explicit_and_backup_safe
+
+claude_hook_starts_pane_only_for_harness_projects() {
+  home="$TMP/claude-hook-home"
+  proj="$TMP/claude-hook-proj"; plain="$TMP/claude-hook-plain"
+  mkdir -p "$home/.local/bin" "$proj/.harness" "$plain"
+  log="$TMP/claude-hook-calls"; : > "$log"
+  cat > "$home/.local/bin/agent-harness-live-status" <<SH
+#!/bin/sh
+printf '%s\n' "\$*" >> "$log"
+SH
+  chmod +x "$home/.local/bin/agent-harness-live-status"
+  # 하네스 프로젝트(.harness 존재): pane 시작을 요청한다.
+  printf '{"cwd":"%s"}' "$proj" \
+    | HOME="$home" bash "$ROOT/scripts/claude-live-status-hook.sh" || return 1
+  grep -Fq "start $proj claude" "$log" || return 1
+  # 일반 디렉터리: 아무것도 하지 않고 성공 종료한다.
+  printf '{"cwd":"%s"}' "$plain" \
+    | HOME="$home" bash "$ROOT/scripts/claude-live-status-hook.sh" || return 1
+  [ "$(wc -l < "$log" | tr -d ' ')" = 1 ]
+}
+t "claude hook: 하네스 프로젝트에서만 status pane을 시작" 0 \
+  claude_hook_starts_pane_only_for_harness_projects
+
+install_enable_live_status_registers_claude_hook_once() {
+  home="$TMP/install-live-hook-home"
+  bin="$TMP/install-live-hook-bin"
+  mkdir -p "$home/.claude" "$home/cmux-harness-status/bin" "$bin"
+  printf '#!/bin/sh\nexit 0\n' > "$home/cmux-harness-status/bin/cmux-harness-status"
+  chmod +x "$home/cmux-harness-status/bin/cmux-harness-status"
+  printf '#!/bin/sh\nexit 0\n' > "$bin/cmux"
+  chmod +x "$bin/cmux"
+  printf '{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"keep-hook"}]}]}}\n' \
+    > "$home/.claude/settings.json"
+  HOME="$home" PATH="$bin:$PATH" bash "$ROOT/install.sh" --enable-live-status >/dev/null 2>&1 || return 1
+  HOME="$home" PATH="$bin:$PATH" bash "$ROOT/install.sh" --enable-live-status >/dev/null 2>&1 || return 1
+  s="$home/.claude/settings.json"
+  hook="$ROOT/scripts/claude-live-status-hook.sh"
+  # 기존 훅은 보존되고, 우리 훅은 두 번 설치해도 한 번만 등록된다.
+  [ "$(jq -r '[.hooks.UserPromptSubmit[]?.hooks[]?.command] | index("keep-hook") != null' "$s")" = true ] || return 1
+  [ "$(jq --arg h "$hook" -r '[.hooks.UserPromptSubmit[]?.hooks[]?.command | select(. == $h)] | length' "$s")" = 1 ]
+}
+t "install --enable-live-status: Claude UserPromptSubmit 훅을 멱등 등록" 0 \
+  install_enable_live_status_registers_claude_hook_once
 
 install_refuses_unrelated_status_launcher() {
   home="$TMP/install-live-launcher-conflict"

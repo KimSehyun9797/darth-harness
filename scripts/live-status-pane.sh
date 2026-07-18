@@ -26,6 +26,23 @@ valid_surface() { printf '%s' "$1" | grep -Eq '^surface:[0-9]+$'; }
 valid_thread() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9-]+$'; }
 read_key() { awk -F= -v k="$2" '$1 == k {sub(/^[^=]*=/, ""); print; exit}' "$1" 2>/dev/null || true; }
 
+# 새 status pane이 압축 레이아웃으로 떨어지지 않게 높이를 best-effort로 확보한다.
+# cmux resize-pane의 amount는 픽셀 단위이고, bottom pane은 -U가 위 경계를 올려
+# 커진다. 재사용(REUSED)에는 적용하지 않는다 — 매 세션마다 자라지 않게 하고,
+# 사용자가 직접 줄인 높이를 존중한다. 실패해도 start를 막지 않는다.
+ensure_pane_height() { # $1=workspace $2=surface
+  local pane
+  for pane in $(cmux list-panes --workspace "$1" 2>/dev/null | grep -o 'pane:[0-9]*'); do
+    if cmux list-pane-surfaces --workspace "$1" --pane "$pane" 2>/dev/null \
+      | grep -q "$2[^0-9]"; then
+      cmux resize-pane --pane "$pane" --workspace "$1" -U --amount 100 \
+        >/dev/null 2>&1 || true
+      return 0
+    fi
+  done
+  return 0
+}
+
 close_surface() {
   surface="$1"
   if ! cmux close-surface --surface "$surface" >/dev/null 2>&1; then
@@ -109,4 +126,5 @@ cmux send --surface "$surface" "$command" >/dev/null 2>&1 || exit 1
 cmux send-key --surface "$surface" enter >/dev/null 2>&1 \
   || cmux send-key --surface "$surface" Enter >/dev/null 2>&1 || true
 publish_meta "$workspace" "$surface" "$current_thread" || exit 1
+ensure_pane_height "$workspace" "$surface"
 printf 'STARTED %s/%s\n' "$workspace" "$surface"
