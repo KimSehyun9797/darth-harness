@@ -3774,8 +3774,9 @@ t "live lifecycle docs: start·phase·worker·close와 pane/monitor 규칙을 �
    && grep -Fq 'later worker: split down' '$ROOT/skills/harness/SKILL.md' \
    && grep -Fq 'cmux read-screen' '$ROOT/skills/harness/SKILL.md' \
    && grep -Fq 'ps를 사용하지 않는다' '$ROOT/skills/harness/SKILL.md' \
-   && grep -Fq 'agent-harness-live-status' '$ROOT/template/HARNESS.md' \
-   && grep -Fq '매 하네스 세션' '$ROOT/README.md' \
+   && grep -Fq 'agent-harness-live-status' '$ROOT/template/HARNESS.md'"
+ti "live lifecycle docs: working 저장소 README는 자동 시작·migration 경로를 안내" 0 bash -c \
+  "grep -Fq '매 하네스 세션' '$ROOT/README.md' \
    && grep -Fq 'migrate-live-status.sh --dry-run' '$ROOT/README.md'"
 
 # --- TUI-P5: 전체 Queue 1–9 로드맵 스냅샷 ---
