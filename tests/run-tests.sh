@@ -3815,6 +3815,9 @@ JSON
   [ -x "$(readlink "$link")" ] || return 1
   [ -L "$launcher" ] || return 1
   [ "$(readlink "$launcher")" = "$ROOT/scripts/live-status-pane.sh" ] || return 1
+  status_tui="$home/.local/bin/status-tui"
+  [ -L "$status_tui" ] || return 1
+  [ "$(readlink "$status_tui")" = "$ROOT/scripts/status-tui.sh" ] || return 1
   [ "$(find "$home/.claude" -name 'settings.json.bak.*' | wc -l | tr -d ' ')" = 1 ] || return 1
   [ "$(yq -r '.keep' "$home/.claude/settings.json")" = unchanged ] || return 1
   [ "$(yq -r '.statusLine.type' "$home/.claude/settings.json")" = command ] || return 1

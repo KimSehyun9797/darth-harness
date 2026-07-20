@@ -95,10 +95,18 @@ enable_live_status() {
     printf 'ERROR: unrelated executable exists: %s\n' "$launcher_bin" >&2
     return 1
   fi
+  status_tui_bin="$HOME/.local/bin/status-tui"
+  status_tui_target="$ROOT/scripts/status-tui.sh"
+  if [ -L "$status_tui_bin" ] && [ "$(readlink "$status_tui_bin")" = "$status_tui_target" ]; then :
+  elif [ -e "$status_tui_bin" ] || [ -L "$status_tui_bin" ]; then
+    printf 'ERROR: unrelated executable exists: %s\n' "$status_tui_bin" >&2
+    return 1
+  fi
 
   mkdir -p "$(dirname "$local_bin")" "$HOME/.claude"
   [ -L "$local_bin" ] || ln -s "$consumer" "$local_bin"
   [ -L "$launcher_bin" ] || ln -s "$launcher_target" "$launcher_bin"
+  [ -L "$status_tui_bin" ] || ln -s "$status_tui_target" "$status_tui_bin"
   if [ -e "$settings" ]; then
     backup="$settings.bak.$(date +%Y%m%d%H%M%S).$$"
     cp -p "$settings" "$backup"
@@ -127,6 +135,7 @@ enable_live_status() {
   printf '  [LIVE]  consumer: %s -> %s\n' "$local_bin" "$consumer"
   printf '  [LIVE]  auto-start: %s -> %s\n' "$launcher_bin" "$launcher_target"
   printf '  [LIVE]  claude hook: UserPromptSubmit -> %s\n' "$hook_command"
+  printf '  [LIVE]  manual command: %s -> %s\n' "$status_tui_bin" "$status_tui_target"
   printf '  [LIVE]  Claude statusLine old: %s\n' "$old_command"
   printf '  [LIVE]  Claude statusLine new: %s\n' "$new_command"
 }
