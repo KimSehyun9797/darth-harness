@@ -2175,6 +2175,19 @@ ti "docs: 현재 상태의 history 링크는 모두 존재" 0 bash -c \
   'root="$1"; paths="$(rg -o --no-filename "docs/history/[A-Za-z0-9._/-]+\\.md" "$root/HANDOFF.md" "$root/docs/BACKLOG.md" | sort -u)"; [ -n "$paths" ] || exit 1; printf "%s\n" "$paths" | while IFS= read -r p; do test -f "$root/$p" || exit 1; done' _ "$ROOT"
 ti "docs: 완료된 B-006을 미착수 현재 게이트로 표시하지 않음" 0 bash -c \
   "! rg -q 'B-006.*(미착수|작성본 최종 승인|계획 승인 대기)' '$ROOT/HANDOFF.md' '$ROOT/docs/BACKLOG.md'"
+# shellcheck disable=SC2016 # $1은 자식 bash의 위치 인자다.
+ti "docs: BACKLOG approved queue와 ROADMAP 항목이 기계 대조로 일치" 0 bash -c '
+  root="$1"
+  nums="$(grep -oE "^[0-9]+\." "$root/docs/BACKLOG.md" | tr -d . | sort -un)"
+  [ -n "$nums" ] || { echo "no numbered backlog items"; exit 1; }
+  for n in $nums; do
+    yq -e ".items[] | select(.id == \"Q$n\")" "$root/ROADMAP.yaml" >/dev/null 2>&1 \
+      || { echo "ROADMAP missing Q$n"; exit 1; }
+  done
+  for id in $(yq -r ".items[].id" "$root/ROADMAP.yaml" | grep -E "^Q[0-9]+$"); do
+    printf "%s\n" "$nums" | grep -qx "${id#Q}" \
+      || { echo "ROADMAP $id has no BACKLOG entry"; exit 1; }
+  done' _ "$ROOT"
 fi
 
 # --- B-006 context loading Task 1: contract RED/GREEN block ---
@@ -3021,6 +3034,40 @@ live_status_provider_switch_resets_usage() {
 }
 t "live-status(orch): 공급자 전환 시 이전 사용량·모델을 이어받지 않음" 0 \
   live_status_provider_switch_resets_usage
+
+live_status_usage_has_its_own_capture_time() {
+  p="$TMP/live-orch-usage-age"
+  make_live_project "$p"
+  HARNESS_PROJECT_ROOT="$p" "$p/.harness/bin/live-status" orchestrator-update \
+    --provider claude --weekly-left-pct 40 --captured-at 1784044800 || return 1
+  f="$p/.harness/live-status.env"
+  grep -Fx 'HARNESS_USAGE_CAPTURED_AT=1784044800' "$f" >/dev/null || return 1
+  # 사용량 없는 갱신은 전체 시각만 바꾸고 사용량 시각은 이어받는다.
+  HARNESS_PROJECT_ROOT="$p" "$p/.harness/bin/live-status" orchestrator-update \
+    --provider claude --phase implement --captured-at 1784044900 || return 1
+  grep -Fx 'HARNESS_CAPTURED_AT=1784044900' "$f" >/dev/null || return 1
+  grep -Fx 'HARNESS_USAGE_CAPTURED_AT=1784044800' "$f" >/dev/null
+}
+t "live-status(orch): 사용량 수집 시각은 사용량 갱신에만 전진" 0 \
+  live_status_usage_has_its_own_capture_time
+
+statusline_feeds_active_project_pointer() {
+  p="$TMP/statusline-pointer-proj"
+  make_live_project "$p"
+  state="$TMP/statusline-pointer-state"
+  mkdir -p "$state"
+  printf '%s\n' "$p" > "$state/active-project"
+  out="$(printf '{"workspace":{"current_dir":"%s"},"model":{"display_name":"Fable 5"},"context_window":{"used_percentage":30},"rate_limits":{"five_hour":{"used_percentage":10},"seven_day":{"used_percentage":25}}}' "$TMP" \
+    | HARNESS_STATE_DIR="$state" bash "$ROOT/scripts/claude-statusline-tui.sh")" || return 1
+  printf '%s\n' "$out" | grep -Fq 'Fable 5' || return 1
+  f="$p/.harness/live-status.env"
+  grep -Fx 'HARNESS_ORCHESTRATOR_MODEL_OBSERVED=Fable 5' "$f" >/dev/null || return 1
+  grep -Fx 'HARNESS_CONTEXT_REMAINING_PCT=70' "$f" >/dev/null || return 1
+  grep -Fx 'HARNESS_WEEKLY_REMAINING_PCT=75' "$f" >/dev/null || return 1
+  grep -Eq '^HARNESS_USAGE_CAPTURED_AT=[0-9]+$' "$f"
+}
+t "statusline: 프로젝트 밖 세션은 active-project 포인터로 공급" 0 \
+  statusline_feeds_active_project_pointer
 LS="$ROOT/template/.harness/bin/live-status"
 t "live-status(orch): 범위 밖 퍼센트 101 거부" 2 bash -c \
   "HARNESS_PROJECT_ROOT='$TMP/live-rej1' '$LS' orchestrator-update --run-id R --provider codex --weekly-left-pct 101"
@@ -3426,7 +3473,7 @@ status_pane_start_reuses_and_stops() {
   make_live_project "$p"
   log="$TMP/status-pane-calls"
   : > "$log"
-  PATH="$STATUS_PANE_PATH" STATUS_CMUX_LOG="$log" CODEX_THREAD_ID=thread-test \
+  PATH="$STATUS_PANE_PATH" HARNESS_STATE_DIR="$TMP/status-pane-state" STATUS_CMUX_LOG="$log" CODEX_THREAD_ID=thread-test \
     "$LSP" start "$p" codex || return 1
   f="$p/.harness/live-status-pane.env"
   [ "$(stat -f '%Lp' "$f" 2>/dev/null || stat -c '%a' "$f")" = 600 ] || return 1
@@ -3439,12 +3486,15 @@ status_pane_start_reuses_and_stops() {
   grep -F 'send --surface surface:94' "$log" | grep -Fq 'CODEX_THREAD_ID=thread-test' || return 1
   grep -F 'send --surface surface:94' "$log" \
     | grep -Fq "HARNESS_CODEX_BIN=$TMP/status-pane-bin/codex" || return 1
-  PATH="$STATUS_PANE_PATH" STATUS_CMUX_LOG="$log" CODEX_THREAD_ID=thread-test \
+  PATH="$STATUS_PANE_PATH" HARNESS_STATE_DIR="$TMP/status-pane-state" STATUS_CMUX_LOG="$log" CODEX_THREAD_ID=thread-test \
     "$LSP" start "$p" codex || return 1
   [ "$(grep -c '^new-split down --workspace workspace:5$' "$log")" = 1 ] || return 1
   # 높이 확보는 새 split에서 한 번만 — 재사용에서는 다시 resize하지 않는다.
   [ "$(grep -c '^resize-pane --pane pane:7 --workspace workspace:5 -U --amount 100$' "$log")" = 1 ] || return 1
-  PATH="$STATUS_PANE_PATH" STATUS_CMUX_LOG="$log" "$LSP" stop "$p" || return 1
+  # start·reuse는 active-project 포인터를 기록하고, stop은 자기 것일 때만 지운다.
+  [ "$(head -1 "$TMP/status-pane-state/active-project")" = "$p" ] || return 1
+  PATH="$STATUS_PANE_PATH" HARNESS_STATE_DIR="$TMP/status-pane-state" STATUS_CMUX_LOG="$log" "$LSP" stop "$p" || return 1
+  [ ! -e "$TMP/status-pane-state/active-project" ] || return 1
   [ ! -e "$f" ] || return 1
   grep -Fq 'send-key --surface surface:94 ctrl-c' "$log"
 }
@@ -3460,7 +3510,7 @@ status_pane_installed_symlink_uses_source_session() {
   mkdir -p "$home/.local/bin"
   ln -s "$LSP" "$home/.local/bin/agent-harness-live-status"
   log="$TMP/status-pane-installed-link.calls"; : > "$log"
-  PATH="$STATUS_PANE_PATH" STATUS_CMUX_LOG="$log" \
+  PATH="$STATUS_PANE_PATH" HARNESS_STATE_DIR="$TMP/status-pane-state" STATUS_CMUX_LOG="$log" \
     "$home/.local/bin/agent-harness-live-status" start "$p" codex || return 1
   grep -F 'send --surface surface:94' "$log" \
     | grep -Fq "$ROOT/scripts/live-status-session.sh"
@@ -3482,7 +3532,7 @@ HARNESS_STATUS_PANE_SURFACE=surface:93
 HARNESS_STATUS_PANE_STARTED_AT=1784044800
 EOF
   log="$TMP/status-pane-stale-calls"; : > "$log"
-  PATH="$STATUS_PANE_PATH" STATUS_CMUX_LOG="$log" STATUS_CMUX_STALE=1 \
+  PATH="$STATUS_PANE_PATH" HARNESS_STATE_DIR="$TMP/status-pane-state" STATUS_CMUX_LOG="$log" STATUS_CMUX_STALE=1 \
     "$LSP" start "$p" claude || return 1
   grep -Fx 'HARNESS_STATUS_PANE_SURFACE=surface:94' "$p/.harness/live-status-pane.env" >/dev/null || return 1
   [ "$(grep -c '^new-split down --workspace workspace:5$' "$log")" = 1 ]
@@ -3493,9 +3543,9 @@ status_pane_replaces_previous_codex_thread() {
   p="$TMP/status-pane-thread-change"
   make_live_project "$p"
   log="$TMP/status-pane-thread-change.calls"; : > "$log"
-  PATH="$STATUS_PANE_PATH" STATUS_CMUX_LOG="$log" CODEX_THREAD_ID=thread-old \
+  PATH="$STATUS_PANE_PATH" HARNESS_STATE_DIR="$TMP/status-pane-state" STATUS_CMUX_LOG="$log" CODEX_THREAD_ID=thread-old \
     "$LSP" start "$p" codex || return 1
-  PATH="$STATUS_PANE_PATH" STATUS_CMUX_LOG="$log" CODEX_THREAD_ID=thread-new \
+  PATH="$STATUS_PANE_PATH" HARNESS_STATE_DIR="$TMP/status-pane-state" STATUS_CMUX_LOG="$log" CODEX_THREAD_ID=thread-new \
     "$LSP" start "$p" codex || return 1
   [ "$(grep -c '^new-split down --workspace workspace:5$' "$log")" = 2 ] || return 1
   grep -Fq 'close-surface --surface surface:94' "$log" || return 1

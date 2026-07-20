@@ -11,6 +11,22 @@ PROJECT="$(cd "$PROJECT" && pwd)"
 case "$PROVIDER" in claude|codex) :;; *) printf 'ERROR: unsupported provider\n' >&2; exit 2;; esac
 
 META="$PROJECT/.harness/live-status-pane.env"
+STATE_DIR="${HARNESS_STATE_DIR:-$HOME/.local/state/agent-harness}"
+
+# 마지막으로 pane을 켠 프로젝트를 전역 포인터에 기록한다. statusline이 이
+# 포인터로 홈 디렉터리 세션의 게이지를 공급한다. best-effort.
+record_active_project() {
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  tmp="$STATE_DIR/active-project.tmp.$$"
+  printf '%s\n' "$PROJECT" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+  mv "$tmp" "$STATE_DIR/active-project" 2>/dev/null || rm -f "$tmp"
+  return 0
+}
+clear_active_project() {
+  [ "$(head -1 "$STATE_DIR/active-project" 2>/dev/null)" = "$PROJECT" ] || return 0
+  rm -f "$STATE_DIR/active-project" 2>/dev/null || true
+  return 0
+}
 SOURCE="${BASH_SOURCE[0]}"
 while [ -L "$SOURCE" ]; do
   SOURCE_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
@@ -71,6 +87,7 @@ publish_meta() {
 }
 
 if [ "$ACTION" = stop ]; then
+  clear_active_project
   [ -f "$META" ] || exit 0
   surface="$(read_key "$META" HARNESS_STATUS_PANE_SURFACE)"
   if command -v cmux >/dev/null 2>&1 && valid_surface "$surface"; then
@@ -107,6 +124,7 @@ if [ -f "$META" ]; then
     && [ "$old_thread" = "$current_thread" ] \
     && valid_surface "$old_surface" \
     && cmux read-screen --surface "$old_surface" --lines 1 >/dev/null 2>&1; then
+    record_active_project
     printf 'REUSED %s/%s\n' "$workspace" "$old_surface"
     exit 0
   fi
@@ -127,4 +145,5 @@ cmux send-key --surface "$surface" enter >/dev/null 2>&1 \
   || cmux send-key --surface "$surface" Enter >/dev/null 2>&1 || true
 publish_meta "$workspace" "$surface" "$current_thread" || exit 1
 ensure_pane_height "$workspace" "$surface"
+record_active_project
 printf 'STARTED %s/%s\n' "$workspace" "$surface"

@@ -89,6 +89,14 @@ cmd_orchestrator_update() {
     esac
     shift
   done
+  # 사용량 계열 값이 이번 호출에 하나라도 명시됐는지 기록한다. 사용량의 수집
+  # 시각(HARNESS_USAGE_CAPTURED_AT)은 이때만 갱신된다 — 다른 필드 갱신이
+  # 이월된 옛 사용량을 신선하게 보이게 만들지 않는다.
+  usage_passed=false
+  for uv in "$o_ctxp" "$o_ctx" "$o_wkp" "$o_wreset" "$o_credit" "$o_delta" \
+    "$o_cavail" "$o_route"; do
+    [ "$uv" = "$UNSET" ] || { usage_passed=true; break; }
+  done
   # 공급자가 바뀌면 이전 공급자의 모델·사용량·크레딧을 이어받지 않는다.
   # 이번 호출에 명시된 값만 유지하고 나머지는 미상('?')으로 초기화한다.
   old_prov="$(read_key "$target" HARNESS_ORCHESTRATOR_PROVIDER)"
@@ -125,6 +133,13 @@ cmd_orchestrator_update() {
     emit_field "$o_cavail" HARNESS_CODEX_CREDITS_AVAILABLE      "$target"
     emit_field "$o_route"  HARNESS_CODEX_BILLING_ROUTE          "$target"
     emit_field "$o_capt"   HARNESS_CAPTURED_AT                  "$target"
+    if [ "$usage_passed" = true ] && [ "$o_capt" != "$UNSET" ]; then
+      emit_field "$o_capt" HARNESS_USAGE_CAPTURED_AT "$target"
+    elif [ "$usage_passed" = true ]; then
+      printf 'HARNESS_USAGE_CAPTURED_AT=?\n'
+    else
+      emit_field "$UNSET" HARNESS_USAGE_CAPTURED_AT "$target"
+    fi
   } | publish "$target"
 }
 
